@@ -898,5 +898,109 @@ class Artifact(unittest.TestCase):
         self.assertRegex(param["contentId"], rf"PPSA\d{{5}}")
 
 
+class DriverGate(unittest.TestCase):
+    """Which driver archives tools/build-title.sh requires follows the driver.
+
+    The four ps5vk archives were required unconditionally from the commit that
+    linked the driver (0cc661d) through the one that added RADV (f932c82), which
+    was inserted around the check: a RADV build, whose link never sees them
+    (tools/build.sh links exactly APP_VULKAN_ARCHIVES, and the RADV branch sets
+    that to its one archive), failed until ps5vk had been built as well. The
+    gate is run here on the script's own text, from the driver's selection to
+    the end of the RADV branch, with the sibling's link recipe stood in for.
+    """
+
+    script = ROOT / "tools/build-title.sh"
+    ps5vk_archives = (
+        "build/driver/ps5/libps5vk.ps5.a",
+        ".deps/native/vulkan-runtime/lib/libvk_runtime.ps5.a",
+        "build/driver/ps5/libpsbc_driver.ps5.a",
+        ".deps/native/psbc/lib/libpsbc_support.ps5.a",
+    )
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="driver-gate-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.vulkan = self.tmp / "PS5_Vulkan"
+        (self.vulkan / "tools").mkdir(parents=True)
+        # The sibling's recipe sets three variables; the gate reads two of them.
+        (self.vulkan / "tools/radv-link.sh").write_text(
+            'radv_link_recipe() {\n'
+            '    radv_link_inputs=(-L lib --whole-archive "$3" --no-whole-archive'
+            ' --start-group c++.a c++abi.a unwind.a builtins.a platform.a --end-group)\n'
+            '    radv_link_flags=(--wrap=pthread_create --wrap=malloc --defsym=qsort_r=ps5_qsort_r)\n'
+            '}\n', encoding="utf-8")
+        self.radv_archive = self.tmp / "libvulkan_radeon.ps5.a"
+        self.radv_archive.write_bytes(b"!<arch>\n")
+        self.root = self.tmp / "root"
+        self.root.mkdir()
+
+    def gate(self, driver: str, diagnostics: str = "0") -> subprocess.CompletedProcess:
+        text = self.script.read_text(encoding="utf-8")
+        start = text.index('vulkan_dir="${PS5_VULKAN_DIR:-')
+        end = text.index("# Three Mesa utility sources")
+        self.assertLess(start, end, "tools/build-title.sh no longer has the driver gate where this looks")
+        program = (
+            "set -euo pipefail\n"
+            'root=$TEST_ROOT\nsdk=$TEST_ROOT/sdk\n'
+            f"memory_diagnostics={diagnostics}\n"
+            "title_definition_names=(HAVE_VULKAN)\n"
+            + text[start:end]
+            + '\nprintf "%s\\n" "${vulkan_archives[@]}"\n'
+        )
+        env = dict(os.environ, TEST_ROOT=str(self.root), PS5_VULKAN_DIR=str(self.vulkan),
+                   PS5_VULKAN_DRIVER=driver, RADV_ARCHIVE=str(self.radv_archive))
+        return subprocess.run(["bash", "-c", program], capture_output=True, text=True,
+                              env=env, cwd=self.tmp)
+
+    def make_ps5vk_archives(self) -> list[Path]:
+        paths = []
+        for relative in self.ps5vk_archives:
+            path = self.vulkan / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"!<arch>\n" + relative.encode())
+            paths.append(path)
+        return paths
+
+    def test_a_radv_build_does_not_require_the_ps5vk_archives(self) -> None:
+        done = self.gate("radv")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertNotIn("missing", done.stderr)
+        self.assertEqual(done.stdout.split("\n")[:-1], [str(self.radv_archive)],
+                         "a RADV build links its one archive and nothing of ps5vk's")
+
+    def test_a_ps5vk_build_still_requires_its_four_archives(self) -> None:
+        done = self.gate("ps5vk")
+        self.assertEqual(done.returncode, 2, done.stdout)
+        self.assertIn("the Vulkan driver archives are missing", done.stderr)
+        for relative in self.ps5vk_archives:
+            self.assertIn(Path(relative).name, done.stderr, f"{relative} is not reported missing")
+
+    def test_a_radv_diagnostic_build_snapshots_its_one_archive(self) -> None:
+        import hashlib
+        import json
+        done = self.gate("radv", diagnostics="1")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        snapshot = self.root / "build/memory-diagnostic-inputs"
+        records = json.loads((snapshot / "archives.json").read_text(encoding="utf-8"))
+        self.assertEqual(records, {self.radv_archive.name:
+                                   hashlib.sha256(self.radv_archive.read_bytes()).hexdigest()},
+                         "a RADV diagnostic build records its one archive, and nothing of ps5vk's")
+        self.assertEqual(done.stdout.split("\n")[:-1], [str(snapshot / self.radv_archive.name)],
+                         "a RADV diagnostic build links the snapshot copy")
+
+    def test_a_ps5vk_diagnostic_build_snapshots_its_four_archives(self) -> None:
+        import json
+        self.make_ps5vk_archives()
+        done = self.gate("ps5vk", diagnostics="1")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        snapshot = self.root / "build/memory-diagnostic-inputs"
+        records = json.loads((snapshot / "archives.json").read_text(encoding="utf-8"))
+        self.assertEqual(sorted(records), sorted(Path(r).name for r in self.ps5vk_archives))
+        self.assertEqual(done.stdout.split("\n")[:-1],
+                         [str(snapshot / Path(r).name) for r in self.ps5vk_archives],
+                         "a ps5vk diagnostic build links the snapshot copies, in order")
+
+
 if __name__ == "__main__":
     unittest.main()

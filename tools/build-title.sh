@@ -167,48 +167,29 @@ case $vulkan_driver in
     *) echo "PS5_VULKAN_DRIVER must be ps5vk or radv" >&2; exit 2 ;;
 esac
 [[ $vulkan_driver == ps5vk ]] || title_definition_names+=(PS5_RETROARCH_RADV)
-vulkan_archives=(
-    "$vulkan_dir/build/driver/ps5/libps5vk.ps5.a"
-    "$vulkan_dir/.deps/native/vulkan-runtime/lib/libvk_runtime.ps5.a"
-    "$vulkan_dir/build/driver/ps5/libpsbc_driver.ps5.a"
-    "$vulkan_dir/.deps/native/psbc/lib/libpsbc_support.ps5.a"
-)
-vulkan_missing=()
-for archive in "${vulkan_archives[@]}"; do
-    [[ -f $archive ]] || vulkan_missing+=("$archive")
-done
-if (( ${#vulkan_missing[@]} )); then
-    printf 'error: the Vulkan driver archives are missing; the title would link with\n' >&2
-    printf '       vkGetInstanceProcAddr unresolved. Build them in ../PS5_Vulkan\n' >&2
-    printf '       (tools/build-driver.sh) or set PS5_VULKAN_DIR.\n' >&2
-    printf '       missing: %s\n' "${vulkan_missing[@]}" >&2
-    exit 2
-fi
-# The driver may be developed concurrently. A diagnostic link uses stable local
-# archive copies; hashes describe exactly which driver went into this build.
-if [[ $memory_diagnostics == 1 ]]; then
-    if ! snapshot_list=$(python3 - "$root" "${vulkan_archives[@]}" <<'PY_SNAPSHOT'
-import hashlib, json, pathlib, shutil, sys
-out = pathlib.Path(sys.argv[1]) / "build/memory-diagnostic-inputs"
-out.mkdir(parents=True, exist_ok=True)
-records = {}
-for argument in sys.argv[2:]:
-    source = pathlib.Path(argument)
-    before = hashlib.sha256(source.read_bytes()).hexdigest()
-    target = out / source.name
-    shutil.copyfile(source, target)
-    copied = hashlib.sha256(target.read_bytes()).hexdigest()
-    after = hashlib.sha256(source.read_bytes()).hexdigest()
-    if before != copied or before != after:
-        raise SystemExit("Driver archive changed during snapshot; retry when its build finishes")
-    records[source.name] = copied
-    print(target)
-(out / "archives.json").write_text(json.dumps(records, indent=2) + "\n")
-PY_SNAPSHOT
-    ); then
-        echo "error: driver snapshot failed" >&2; exit 2
+# Only the driver being linked is required: ps5vk's four archives here, RADV's
+# one below. A RADV title never links ps5vk's set (tools/build.sh links exactly
+# APP_VULKAN_ARCHIVES, which the RADV branch sets to its archive alone), so a
+# RADV build neither asks for them nor records them as its driver inputs.
+vulkan_archives=()
+if [[ $vulkan_driver == ps5vk ]]; then
+    vulkan_archives=(
+        "$vulkan_dir/build/driver/ps5/libps5vk.ps5.a"
+        "$vulkan_dir/.deps/native/vulkan-runtime/lib/libvk_runtime.ps5.a"
+        "$vulkan_dir/build/driver/ps5/libpsbc_driver.ps5.a"
+        "$vulkan_dir/.deps/native/psbc/lib/libpsbc_support.ps5.a"
+    )
+    vulkan_missing=()
+    for archive in "${vulkan_archives[@]}"; do
+        [[ -f $archive ]] || vulkan_missing+=("$archive")
+    done
+    if (( ${#vulkan_missing[@]} )); then
+        printf 'error: the Vulkan driver archives are missing; the title would link with\n' >&2
+        printf '       vkGetInstanceProcAddr unresolved. Build them in ../PS5_Vulkan\n' >&2
+        printf '       (tools/build-driver.sh) or set PS5_VULKAN_DIR.\n' >&2
+        printf '       missing: %s\n' "${vulkan_missing[@]}" >&2
+        exit 2
     fi
-    mapfile -t vulkan_archives <<< "$snapshot_list"
 fi
 
 # Mesa's weak entry points resolve at link time, and the driver's own symbols must
@@ -232,6 +213,33 @@ if [[ $vulkan_driver == radv ]]; then
     # The C++ runtime, the compiler's builtins and the platform layer.
     vulkan_flags+=" ${radv_link_inputs[*]:5}"
     linker_script="$vulkan_dir/tooling/psbc/ps5-pie-unwind.ld"
+fi
+# The driver may be developed concurrently. A diagnostic link uses stable local
+# copies of the archives being linked - ps5vk's four or RADV's one - and
+# archives.json's hashes describe exactly which driver went into this build.
+if [[ $memory_diagnostics == 1 ]]; then
+    if ! snapshot_list=$(python3 - "$root" "${vulkan_archives[@]}" <<'PY_SNAPSHOT'
+import hashlib, json, pathlib, shutil, sys
+out = pathlib.Path(sys.argv[1]) / "build/memory-diagnostic-inputs"
+out.mkdir(parents=True, exist_ok=True)
+records = {}
+for argument in sys.argv[2:]:
+    source = pathlib.Path(argument)
+    before = hashlib.sha256(source.read_bytes()).hexdigest()
+    target = out / source.name
+    shutil.copyfile(source, target)
+    copied = hashlib.sha256(target.read_bytes()).hexdigest()
+    after = hashlib.sha256(source.read_bytes()).hexdigest()
+    if before != copied or before != after:
+        raise SystemExit("Driver archive changed during snapshot; retry when its build finishes")
+    records[source.name] = copied
+    print(target)
+(out / "archives.json").write_text(json.dumps(records, indent=2) + "\n")
+PY_SNAPSHOT
+    ); then
+        echo "error: driver snapshot failed" >&2; exit 2
+    fi
+    mapfile -t vulkan_archives <<< "$snapshot_list"
 fi
 
 # Three Mesa utility sources the archives above reference but do not carry:
