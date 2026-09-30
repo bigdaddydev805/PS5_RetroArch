@@ -140,11 +140,28 @@ if [[ ! -f $work/config.mk || ! -f $work/config.h || ! -f $work/.configure-id ||
             exit 2
         }
     fi
+    # --enable-vulkan makes configure link a test program against -lvulkan
+    # (qb/config.libs.sh: check_lib '' VULKAN -lvulkan vkCreateInstance) and stop
+    # when that fails. The SDK ships no libvulkan, and ../PS5_Vulkan's drivers are
+    # archives tools/build-title.sh links whole, under names -lvulkan does not
+    # find. The probe only decides HAVE_VULKAN; the -lvulkan it records in
+    # config.mk is never read by this project's link. So configure alone is given
+    # a stub (tooling/ps5-stubs/vulkan_configure_stub.c), built with configure's
+    # own compiler into build/configure-stubs/libvulkan.a, and that directory is
+    # appended to LDFLAGS inside the configure subshell only.
+    configure_stubs="$root/build/configure-stubs"
+    rm -rf "$configure_stubs"
+    mkdir -p "$configure_stubs"
+    PS5_PAYLOAD_SDK="$sdk" "$sdk/bin/prospero-clang" -std=c11 -O2 -fPIC \
+        -c "$root/tooling/ps5-stubs/vulkan_configure_stub.c" \
+        -o "$configure_stubs/vulkan_configure_stub.o"
+    "$sdk/bin/llvm-ar" rcsD "$configure_stubs/libvulkan.a" "$configure_stubs/vulkan_configure_stub.o"
     (
         cd "$work"
         export PS5_PAYLOAD_SDK="$sdk"
         export CC="$sdk/bin/prospero-clang" CXX="$sdk/bin/prospero-clang++"
         export OS=BSD DISTRO=
+        export LDFLAGS="${LDFLAGS:+$LDFLAGS }-L$configure_stubs"
         ./configure "${configure_flags[@]}" >"$work/configure.log" 2>&1
     ) || { echo "error: configure failed; see $work/configure.log" >&2; exit 2; }
     printf '%s\n' "$configure_id" > "$work/.configure-id"
