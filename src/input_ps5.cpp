@@ -43,6 +43,75 @@
  * two since the last MARK, so a run's frame rate is read over exact script
  * times. Testing only: the file is never shipped.
  *
+ * The pad's motion sensors, the DualSense's accelerometer and gyroscope, reach
+ * cores through libretro's sensor interface: a core enables one with
+ * RETRO_SENSOR_ACCELEROMETER_ENABLE or RETRO_SENSOR_GYROSCOPE_ENABLE (RetroArch
+ * routes both to this joypad's `set_sensor_state`) and reads six values a
+ * frame through `get_sensor_input`. The Dolphin core is the consumer this was
+ * built for: it asks for both on its first frame and feeds them to the
+ * emulated Wii Remote.
+ *
+ * Where the samples hold the motion data was verified on a PS5 on 2026-09-30
+ * with the MOTION probe below: acceleration at 0x1c and angular velocity at
+ * 0x28, the PS4 layout's offsets (OpenOrbis's pad.h), which also places
+ * `connected` at 0x4c and the timestamp at 0x50. The fields are real, stable
+ * and responsive, and they update whether or not scePadSetMotionSensorState
+ * has been called; the quaternion at 0x0c is still only the PS4 layout's
+ * candidate.
+ *
+ * Units, from the same run: acceleration in g including gravity (the resting
+ * magnitude is 1 g) and angular velocity in rad/s (a brisk bank read 3.15,
+ * which is 180 degrees a second; in degrees it would have been imperceptible).
+ * Those are the units libretro cores get: libretro.h says m/s^2 for the
+ * accelerometer, but RetroArch's own SDL joypad driver divides SDL's m/s^2 by
+ * standard gravity and the Dolphin core multiplies by it again, so g is the
+ * unit in practice, and the gyroscope is rad/s everywhere. No unit conversion
+ * happens here.
+ *
+ * Axes. libretro.h's frame is X right, Y up, Z toward the player, the
+ * angular velocity about those same axes and positive counter-clockwise seen
+ * from the axis's positive end (the right-hand rule). The pad's raw frame,
+ * measured by tilting and turning it on the console:
+ *
+ *   accel X   left handle down (right side up) positive   = libretro X
+ *   accel Y   the resting 1 g axis, top face up            = libretro Y
+ *   accel Z   front (USB) edge down (player's edge up) +   = libretro Z
+ *   gyro [0]  pitch, the front edge rising or dipping      = libretro X
+ *   gyro [1]  yaw, turning flat: LEFT negative, right +    = libretro Y negated
+ *   gyro [2]  roll, banking: LEFT HANDLE UP negative        = libretro Z
+ *
+ * The one transformation is the yaw sign: a flat left turn is
+ * counter-clockwise seen from above, which libretro.h calls positive, and the
+ * pad reports it negative. Roll already follows the rule (a left handle
+ * rising is clockwise seen from the player, at the positive end of Z), and
+ * pitch is passed through on the same assumption, the front edge rising
+ * positive. The accelerometer's X and Z read positive on the side that is up,
+ * so Y is taken to read +1 g with the top face up; the console run did not
+ * record Y's resting sign, and the MOTION probe prints it. See
+ * `to_libretro_frame`. Dolphin reads libretro's three values as the Wii
+ * Remote's own frame (X left, Y toward the player, Z up); the rotation between
+ * the two is applied inside the core, in patches/dolphin/ps5-port.patch, not
+ * here, so other cores get libretro.h's frame.
+ *
+ * Lifecycle: the pad's sensor switch is thrown on when a core enables either
+ * sensor and off only when neither is enabled any more (or the driver closes),
+ * so disabling one sensor never silences the other. A pad that reconnects is
+ * told again. `accelerometer_enabled` and `gyroscope_enabled` are what the
+ * core asked for, nothing else: they gate `get_sensor_input`, and the trace's
+ * "core asked accel=0 gyro=0" alongside live raw values is the expected
+ * picture whenever no core has enabled the sensors (the menu, or a core that
+ * does not use them). One pad is opened, so the sensors exist for port 0
+ * only; the other ports answer false, which a core takes as "no sensor there".
+ *
+ * The hardware probe, testing only: `<seconds> MOTION [seconds]` in the pad
+ * script prints, on every poll for that long (once, without a duration), the
+ * newest sample's raw accelerometer and gyroscope, the values a core is handed
+ * (libretro's frame, chosen from the frame's batch as `frame_motion` says),
+ * what the core has asked for, the pad's switch, how many sensor reads the
+ * core made in the last frame and the batch's size, with the orientation
+ * and the sample's bytes 0x08..0x33 the first time. The first sample after the
+ * sensors switch on is traced the same way.
+ *
  * Reference: docs/REFERENCE.md, "Input".
  */
 
@@ -52,6 +121,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <new>
 
@@ -79,6 +149,10 @@ extern "C"
                             const void *params);
     std::int32_t scePadRead(std::int32_t handle, void *samples, std::int32_t capacity);
     std::int32_t scePadClose(std::int32_t handle);
+    /* The motion sensors, on or off for a handle. The shape is the PS4 one;
+     * on a PS5 the call returned 0 (2026-09-30), and the sample's motion
+     * fields update whether or not it has been made. */
+    std::int32_t scePadSetMotionSensorState(std::int32_t handle, bool enable);
     std::int32_t sceUserServiceInitialize(const void *params);
     std::int32_t sceUserServiceGetInitialUser(std::int32_t *user_id);
     std::int32_t sceUserServiceTerminate();
@@ -116,7 +190,14 @@ struct PadSample
     std::uint8_t right_y;
     std::uint8_t left_trigger;
     std::uint8_t right_trigger;
-    std::uint8_t reserved_to_connected[66];
+    std::uint8_t reserved_0a[2];
+    /* The motion block. Acceleration (g, including gravity) and angular
+     * velocity (rad/s) were verified on a PS5 (see the top of this file); the
+     * orientation quaternion x y z w is still the PS4 layout's candidate. */
+    float orientation[4];
+    float acceleration[3];
+    float angular_velocity[3];
+    std::uint8_t touch[24];
     std::int32_t connected;
     std::uint64_t timestamp_us;
     std::uint8_t extension[16];
@@ -126,6 +207,11 @@ struct PadSample
 
 static_assert(sizeof(PadSample) == 120, "the console's pad samples are 120 bytes");
 static_assert(offsetof(PadSample, left_x) == 0x04, "the stick bytes follow the button word");
+// The motion offsets: acceleration and angular velocity verified on a PS5, the
+// orientation still the PS4 layout's candidate.
+static_assert(offsetof(PadSample, orientation) == 0x0c, "PS4 layout: orientation at 0x0c");
+static_assert(offsetof(PadSample, acceleration) == 0x1c, "acceleration sits at 0x1c");
+static_assert(offsetof(PadSample, angular_velocity) == 0x28, "angular velocity sits at 0x28");
 static_assert(offsetof(PadSample, connected) == 0x4c, "connection state sits at 0x4c");
 static_assert(offsetof(PadSample, timestamp_us) == 0x50, "the timestamp sits at 0x50");
 
@@ -146,6 +232,34 @@ extern "C" void ps5_input_trace(const char *line) noexcept;
 
 namespace
 {
+/* The six values a core reads, in libretro's frame and units. */
+struct LibretroMotion
+{
+    float accel[3]; // g, X right, Y up, Z toward the player
+    float gyro[3];  // rad/s about the same axes, counter-clockwise positive
+};
+
+/* The pad's raw motion sample in libretro's frame (see the top of this file).
+ * The accelerometer's axes are libretro's already, in g. The gyroscope's are
+ * the same three axes, in rad/s, and only its yaw sign differs: the pad
+ * reports a flat left turn negative and libretro.h wants it positive. This
+ * table is the measured mapping; a console trace that shows a different sign
+ * is corrected here, not downstream. */
+constexpr float accelerometer_sign[3] = {1.0f, 1.0f, 1.0f};
+constexpr float gyroscope_sign[3] = {1.0f, -1.0f, 1.0f};
+
+LibretroMotion to_libretro_frame(const float raw_acceleration[3],
+                                 const float raw_angular_velocity[3]) noexcept
+{
+    LibretroMotion motion{};
+    for (unsigned axis = 0; axis < 3; ++axis)
+    {
+        motion.accel[axis] = accelerometer_sign[axis] * raw_acceleration[axis];
+        motion.gyro[axis] = gyroscope_sign[axis] * raw_angular_velocity[axis];
+    }
+    return motion;
+}
+
 struct PadState
 {
     std::int32_t handle = -1;
@@ -157,6 +271,23 @@ struct PadState
     std::uint32_t buttons = 0;
     bool owns_user_service = false;
     bool announced = false;
+    /* What the core asked for through set_sensor_state (not whether the pad
+     * has motion data: it always does), what the pad's switch was last told,
+     * and whether the first sample after switching on is still to be traced. */
+    bool accelerometer_enabled = false;
+    bool gyroscope_enabled = false;
+    bool motion_on = false;
+    bool motion_first_sample_pending = false;
+    /* Diagnostics: how many sensor values the core read since this poll and in
+     * the whole previous frame, so a trace can tell "the core is reading" from
+     * "the values exist". */
+    unsigned sensor_reads_this_frame = 0;
+    unsigned sensor_reads_last_frame = 0;
+    /* The frame's motion for the core (see `frame_motion`), whether it is
+     * usable, and how many samples the last read returned. */
+    LibretroMotion core_motion{};
+    bool core_motion_valid = false;
+    std::int32_t motion_batch = 0;
 };
 
 PadState *active_pad = nullptr;
@@ -183,6 +314,7 @@ enum class ScriptActionKind
     load_state,
     screenshot,
     mark,
+    motion,
 };
 // The core's new frames (gfx/video_driver.c, patches/series 0101), the
 // longest time between two of them since the last MARK and how many came more
@@ -199,7 +331,9 @@ struct ScriptAction
     double at;
     bool done;
     ScriptActionKind kind;
-    int slot; // SAVE_STATE and LOAD_STATE: the slot given, or -1 for the current one
+    // SAVE_STATE and LOAD_STATE: the slot given, or -1 for the current one.
+    // MOTION: the seconds to keep tracing, or -1 for one line.
+    int argument;
 };
 constexpr int action_capacity = 32;
 ScriptAction actions[action_capacity];
@@ -207,6 +341,23 @@ int action_count = 0;
 int screenshot_count = 0;
 bool script_started = false;
 std::chrono::steady_clock::time_point script_start;
+// The MOTION action's tracing: at least once, then while the clock is short of
+// the deadline.
+bool motion_trace_once = false;
+bool motion_trace_bytes = false;
+double motion_trace_deadline = -1.0;
+
+/* Seconds since the script's clock started; the first call starts it. */
+double script_seconds() noexcept
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (!script_started)
+    {
+        script_started = true;
+        script_start = now;
+    }
+    return std::chrono::duration<double>(now - script_start).count();
+}
 
 /* A script's stick directions follow the 16 RetroPad buttons in its masks, two
  * a stick axis (left X, left Y, right X, right Y), the negative one first. */
@@ -250,7 +401,8 @@ void load_script() noexcept
                             {"SAVE_STATE", ScriptActionKind::save_state},
                             {"LOAD_STATE", ScriptActionKind::load_state},
                             {"SCREENSHOT", ScriptActionKind::screenshot},
-                            {"MARK", ScriptActionKind::mark}};
+                            {"MARK", ScriptActionKind::mark},
+                            {"MOTION", ScriptActionKind::motion}};
         bool is_action = false;
         for (const auto &named : action_names)
             if (std::strcmp(buttons, named.name) == 0 && action_count < action_capacity)
@@ -392,6 +544,121 @@ std::int16_t stick_axis(std::uint8_t value) noexcept
     return static_cast<std::int16_t>(scaled);
 }
 
+/* One libretro sensor value (RETRO_SENSOR_ACCELEROMETER_X..GYROSCOPE_Z). */
+float motion_component(const LibretroMotion &motion, unsigned id) noexcept
+{
+    if (id >= RETRO_SENSOR_GYROSCOPE_X)
+        return motion.gyro[id - RETRO_SENSOR_GYROSCOPE_X];
+    return motion.accel[id - RETRO_SENSOR_ACCELEROMETER_X];
+}
+
+/* The motion a core is handed for a frame, out of the batch of samples one
+ * read returned (about four at the pad's rate). A core reads once a frame,
+ * and a swing's peak lasts a few samples, so the newest sample alone can
+ * miss it: the accelerometer is the batch's sharpest sample, the one whose
+ * magnitude strays furthest from the resting 1 g, taken whole so its
+ * direction is a real one. The gyroscope is the batch's mean, which is the
+ * exact rate over the frame for anything integrating it into an angle
+ * (MotionPlus pointing). At rest or in a slow tilt the samples agree and both
+ * are the newest sample within noise. Samples taken while the pad was away or
+ * the shell had it are left out; false when none is usable. */
+bool frame_motion(const PadSample *samples, int count, LibretroMotion &out) noexcept
+{
+    const PadSample *sharpest = nullptr;
+    float sharpest_stray = -1.0f;
+    float gyro_sum[3] = {0.0f, 0.0f, 0.0f};
+    int usable = 0;
+    for (int index = 0; index < count; ++index)
+    {
+        const PadSample &sample = samples[index];
+        if (!sample.connected || (sample.buttons & pad_button_intercepted) != 0)
+            continue;
+        ++usable;
+        const float *a = sample.acceleration;
+        const float stray = std::fabs(std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) - 1.0f);
+        // Ties go to the later sample, so an unmoving pad reads its newest.
+        if (sharpest == nullptr || stray >= sharpest_stray)
+        {
+            sharpest = &sample;
+            sharpest_stray = stray;
+        }
+        for (unsigned axis = 0; axis < 3; ++axis)
+            gyro_sum[axis] += sample.angular_velocity[axis];
+    }
+    if (usable == 0)
+        return false;
+    float gyro_mean[3];
+    for (unsigned axis = 0; axis < 3; ++axis)
+        gyro_mean[axis] = gyro_sum[axis] / static_cast<float>(usable);
+    out = to_libretro_frame(sharpest->acceleration, gyro_mean);
+    return true;
+}
+
+/* Tells the pad whether anything wants its motion sensors, once per change. The
+ * service's own filters are left at their defaults. */
+void apply_motion_state(PadState &state) noexcept
+{
+    const bool wanted = state.accelerometer_enabled || state.gyroscope_enabled;
+    if (state.handle < 0 || wanted == state.motion_on)
+        return;
+    const std::int32_t result = scePadSetMotionSensorState(state.handle, wanted);
+    state.motion_on = wanted && result == 0;
+    char line[176];
+    std::snprintf(line, sizeof(line),
+                  "input: motion sensors %s (core asked accel=%d gyro=%d): "
+                  "scePadSetMotionSensorState=0x%x",
+                  wanted ? "on" : "off", state.accelerometer_enabled ? 1 : 0,
+                  state.gyroscope_enabled ? 1 : 0, static_cast<unsigned>(result));
+    ps5_input_trace(line);
+    if (state.motion_on)
+        state.motion_first_sample_pending = true;
+}
+
+/* The newest sample's motion as trace lines: the raw accelerometer and
+ * gyroscope X Y Z, then the values a core is handed (libretro's frame) with
+ * what the core asked for, the pad's switch and how many sensor reads the core
+ * made in the last frame; with `bytes`, the candidate orientation and the
+ * sample's bytes from the triggers to the touch data too, so the layout can be
+ * checked against what the service wrote. */
+void trace_motion(const PadState &state, double seconds, bool bytes) noexcept
+{
+    const PadSample *sample = newest_sample(state);
+    if (sample == nullptr)
+    {
+        ps5_input_trace("input: motion: no pad sample");
+        return;
+    }
+    const float *a = sample->acceleration;
+    const float *g = sample->angular_velocity;
+    char line[224];
+    std::snprintf(line, sizeof(line),
+                  "input: motion at %.3f s: raw accel %+.4f %+.4f %+.4f gyro %+.4f %+.4f %+.4f",
+                  seconds, a[0], a[1], a[2], g[0], g[1], g[2]);
+    ps5_input_trace(line);
+    const LibretroMotion motion =
+        state.core_motion_valid ? state.core_motion : to_libretro_frame(a, g);
+    std::snprintf(line, sizeof(line),
+                  "input: motion to core: accel %+.4f %+.4f %+.4f gyro %+.4f %+.4f %+.4f "
+                  "(core asked accel=%d gyro=%d, pad switch %s, %u core reads last frame, "
+                  "%d samples)",
+                  motion.accel[0], motion.accel[1], motion.accel[2], motion.gyro[0], motion.gyro[1],
+                  motion.gyro[2], state.accelerometer_enabled ? 1 : 0,
+                  state.gyroscope_enabled ? 1 : 0, state.motion_on ? "on" : "off",
+                  state.sensor_reads_last_frame, static_cast<int>(state.motion_batch));
+    ps5_input_trace(line);
+    if (!bytes)
+        return;
+    const float *q = sample->orientation;
+    std::snprintf(line, sizeof(line), "input: motion orientation x y z w %+.3f %+.3f %+.3f %+.3f",
+                  q[0], q[1], q[2], q[3]);
+    ps5_input_trace(line);
+    const auto *raw = reinterpret_cast<const unsigned char *>(sample);
+    int written = std::snprintf(line, sizeof(line), "input: motion sample bytes 0x08..0x33:");
+    for (std::size_t i = 0x08; i < 0x34 && written > 0 && written < int(sizeof(line)) - 3; ++i)
+        written += std::snprintf(line + written, sizeof(line) - written, " %02x", raw[i]);
+    ps5_input_trace(line);
+}
+
 void *open_pad() noexcept
 {
     auto *state = new (std::nothrow) PadState();
@@ -457,11 +724,15 @@ void poll_pad(void *data) noexcept
          * down. */
         state->sample_count = 0;
         state->buttons = 0;
+        state->core_motion_valid = false;
+        state->motion_batch = 0;
         return;
     }
     state->sample_count = count;
     const PadSample *newest = newest_sample(*state);
     state->buttons = newest != nullptr ? newest->buttons : 0;
+    state->motion_batch = count;
+    state->core_motion_valid = frame_motion(state->samples, count, state->core_motion);
 
     /* Successful button transitions are routine, not diagnostics. Keep pad-open
      * failures and lifecycle logs, without a synchronous file write per press. */
@@ -474,6 +745,8 @@ void close_pad(void *data) noexcept
         return;
     if (state->handle >= 0)
     {
+        if (state->motion_on)
+            (void)scePadSetMotionSensorState(state->handle, false);
         (void)scePadClose(state->handle);
         state->handle = -1;
     }
@@ -494,7 +767,7 @@ void *joypad_init(void *) noexcept
             load_script();
     }
     if (active_pad)
-        ps5_input_trace("input: ps5 joypad registered (16 buttons, 6 axes)");
+        ps5_input_trace("input: ps5 joypad registered (16 buttons, 6 axes, motion sensors)");
     return active_pad;
 }
 
@@ -536,13 +809,7 @@ void run_script_actions() noexcept
 {
     if (action_count == 0)
         return;
-    if (!script_started)
-    {
-        script_started = true;
-        script_start = std::chrono::steady_clock::now();
-    }
-    const double seconds =
-        std::chrono::duration<double>(std::chrono::steady_clock::now() - script_start).count();
+    const double seconds = script_seconds();
     for (int i = 0; i < action_count; ++i)
     {
         ScriptAction &action = actions[i];
@@ -558,8 +825,8 @@ void run_script_actions() noexcept
             // made from the slot when the command runs)
             settings_t *settings = config_get_ptr();
             const int slot = settings->ints.state_slot;
-            if (action.slot >= 0)
-                settings->ints.state_slot = action.slot;
+            if (action.argument >= 0)
+                settings->ints.state_slot = action.argument;
             const bool ok =
                 command_event(save ? CMD_EVENT_SAVE_STATE : CMD_EVENT_LOAD_STATE, nullptr);
             settings->ints.state_slot = slot;
@@ -568,7 +835,7 @@ void run_script_actions() noexcept
 #endif
             char note[96];
             std::snprintf(note, sizeof(note), "input: pad script %s %d at %.2f s: %d",
-                          save ? "SAVE_STATE" : "LOAD_STATE", action.slot, seconds, ok ? 1 : 0);
+                          save ? "SAVE_STATE" : "LOAD_STATE", action.argument, seconds, ok ? 1 : 0);
             ps5_input_trace(note);
             continue;
         }
@@ -601,6 +868,18 @@ void run_script_actions() noexcept
                           static_cast<unsigned long long>(new_frames.load(std::memory_order_relaxed)),
                           static_cast<double>(worst_ns) / 1e6,
                           static_cast<unsigned long long>(new_frames_slow.load(std::memory_order_relaxed)));
+            ps5_input_trace(note);
+            continue;
+        }
+        if (action.kind == ScriptActionKind::motion)
+        {
+            const int duration = action.argument > 0 ? action.argument : 0;
+            motion_trace_once = true;
+            motion_trace_bytes = true;
+            motion_trace_deadline = seconds + duration;
+            char note[96];
+            std::snprintf(note, sizeof(note), "input: pad script MOTION at %.2f s for %d s",
+                          seconds, duration);
             ps5_input_trace(note);
             continue;
         }
@@ -641,6 +920,8 @@ void joypad_poll() noexcept
     poll_pad(active_pad);
     if (!active_pad)
         return;
+    active_pad->sensor_reads_last_frame = active_pad->sensor_reads_this_frame;
+    active_pad->sensor_reads_this_frame = 0;
     // Do not announce a disconnect while the shell temporarily intercepts input.
     bool connected = false;
     const PadSample *latest = nullptr;
@@ -652,10 +933,80 @@ void joypad_poll() noexcept
     {
         active_pad->announced = connected;
         if (connected)
+        {
             input_autoconfigure_connect("PS5 Controller", nullptr, nullptr, "ps5", 0, 0, 0);
+            // A pad that comes back is told again what the core asked for, in
+            // case the service reset its sensor state.
+            active_pad->motion_on = false;
+            apply_motion_state(*active_pad);
+        }
         else
             input_autoconfigure_disconnect(0, "PS5 Controller");
     }
+    if (active_pad->motion_first_sample_pending && newest_sample(*active_pad) != nullptr)
+    {
+        active_pad->motion_first_sample_pending = false;
+        trace_motion(*active_pad, script_started ? script_seconds() : 0.0, true);
+    }
+    if (motion_trace_once || motion_trace_deadline >= 0.0)
+    {
+        const double seconds = script_seconds();
+        if (motion_trace_once || seconds <= motion_trace_deadline)
+            trace_motion(*active_pad, seconds, motion_trace_bytes);
+        else
+            motion_trace_deadline = -1.0;
+        motion_trace_once = false;
+        motion_trace_bytes = false;
+    }
+}
+
+bool joypad_set_sensor_state(unsigned port, enum retro_sensor_action action, unsigned rate) noexcept
+{
+    (void)rate; // The service samples at its own rate; a poll reads the newest.
+    if (port != 0 || !active_pad || active_pad->handle < 0)
+        return false;
+    PadState &state = *active_pad;
+    bool *sensor = nullptr;
+    bool enable = false;
+    switch (action)
+    {
+    case RETRO_SENSOR_ACCELEROMETER_ENABLE:
+    case RETRO_SENSOR_ACCELEROMETER_DISABLE:
+        sensor = &state.accelerometer_enabled;
+        enable = action == RETRO_SENSOR_ACCELEROMETER_ENABLE;
+        break;
+    case RETRO_SENSOR_GYROSCOPE_ENABLE:
+    case RETRO_SENSOR_GYROSCOPE_DISABLE:
+        sensor = &state.gyroscope_enabled;
+        enable = action == RETRO_SENSOR_GYROSCOPE_ENABLE;
+        break;
+    default:
+        return false; // No light sensor on a pad.
+    }
+    *sensor = enable;
+    apply_motion_state(state);
+    if (enable && !state.motion_on)
+    {
+        *sensor = false; // The service refused: the core is told there is none.
+        return false;
+    }
+    return true;
+}
+
+bool joypad_get_sensor_input(unsigned port, unsigned id, float *value) noexcept
+{
+    if (port != 0 || !active_pad || value == nullptr)
+        return false;
+    const bool accelerometer = id <= RETRO_SENSOR_ACCELEROMETER_Z;
+    const bool gyroscope = id >= RETRO_SENSOR_GYROSCOPE_X && id <= RETRO_SENSOR_GYROSCOPE_Z;
+    if (!(accelerometer && active_pad->accelerometer_enabled) &&
+        !(gyroscope && active_pad->gyroscope_enabled))
+        return false;
+    ++active_pad->sensor_reads_this_frame;
+    // A pad that is away or held by the shell reads as still, as its buttons do.
+    const bool live = newest_sample(*active_pad) != nullptr && active_pad->core_motion_valid;
+    *value = live ? motion_component(active_pad->core_motion, id) : 0.0f;
+    return true;
 }
 
 bool joypad_query(unsigned port) noexcept
@@ -836,9 +1187,20 @@ extern "C" void ps5_input_reset_autoconfig() noexcept
 }
 
 extern "C" input_device_driver_t ps5_joypad = {
-    joypad_init, joypad_query, joypad_destroy, joypad_button, joypad_state, joypad_get_buttons,
-    joypad_axis, joypad_poll,  nullptr,        nullptr,       nullptr,      nullptr,
-    joypad_name, "ps5",
+    joypad_init,
+    joypad_query,
+    joypad_destroy,
+    joypad_button,
+    joypad_state,
+    joypad_get_buttons,
+    joypad_axis,
+    joypad_poll,
+    nullptr, /* set_rumble */
+    nullptr, /* set_rumble_gain */
+    joypad_set_sensor_state,
+    joypad_get_sensor_input,
+    joypad_name,
+    "ps5",
 };
 
 // Built into RetroArch's autoconfiguration list, so existing saved configs with
