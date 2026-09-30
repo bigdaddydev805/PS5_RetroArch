@@ -350,11 +350,63 @@ int main()
     trace_motion(*active_pad, 1.0, false);
     assert(last_trace.rfind("input: motion to core: accel +0.2500 +1.0000 -0.5000 gyro +0.1000 "
                             "-0.2000 +0.3000 (core asked accel=1 gyro=1, pad switch on, "
-                            "6 core reads last frame)",
+                            "6 core reads last frame, 1 samples)",
                             0) == 0);
     ps5_joypad.poll();
     trace_motion(*active_pad, 1.0, false);
     assert(last_trace.find("0 core reads last frame") != std::string::npos);
+    // A frame's batch: the accelerometer is the sharpest sample, whole, not
+    // the newest and not a per-axis maximum; the gyroscope is the mean; a
+    // sample the shell held is left out of both. Ties go to the newest.
+    {
+        PadSample first = sample(), peak = sample(), last = sample(), held = sample();
+        first.timestamp_us = 20;
+        first.acceleration[1] = 1.0f;
+        first.angular_velocity[2] = 0.3f;
+        peak.timestamp_us = 21;
+        peak.acceleration[0] = 2.0f; // 2.06 g: the swing's peak
+        peak.acceleration[1] = 0.5f;
+        peak.angular_velocity[2] = 0.9f;
+        last.timestamp_us = 22;
+        last.acceleration[1] = 1.1f;
+        last.acceleration[2] = 0.1f; // the newest, no longer at the peak
+        last.angular_velocity[2] = 0.6f;
+        held.timestamp_us = 19; // the oldest, taken while the shell had the pad
+        held.buttons = pad_button_intercepted;
+        held.acceleration[0] = 9.0f;
+        held.angular_velocity[2] = 9.0f;
+        pending = {held, first, peak, last};
+        read_result = 4;
+        ps5_joypad.poll();
+        assert(sensor(RETRO_SENSOR_ACCELEROMETER_X) == 2.0f);
+        assert(sensor(RETRO_SENSOR_ACCELEROMETER_Y) == 0.5f);
+        assert(sensor(RETRO_SENSOR_ACCELEROMETER_Z) == 0.0f);
+        assert(std::fabs(sensor(RETRO_SENSOR_GYROSCOPE_Z) - 0.6f) < 1e-6f);
+        assert(sensor(RETRO_SENSOR_GYROSCOPE_Y) == 0.0f);
+        trace_motion(*active_pad, 2.0, false);
+        assert(last_trace.find("accel +2.0000 +0.5000 +0.0000 gyro +0.0000 -0.0000 +0.6000") !=
+               std::string::npos);
+        assert(last_trace.find(", 4 samples)") != std::string::npos);
+        // At rest every sample is 1 g and the newest wins the tie.
+        first.acceleration[1] = last.acceleration[1] = 1.0f;
+        last.acceleration[2] = 0.0f;
+        last.angular_velocity[2] = first.angular_velocity[2] = 0.0f;
+        last.acceleration[0] = 0.25f;
+        last.acceleration[1] = std::sqrt(1.0f - 0.25f * 0.25f);
+        pending = {first, last};
+        read_result = 2;
+        ps5_joypad.poll();
+        assert(sensor(RETRO_SENSOR_ACCELEROMETER_X) == 0.25f);
+        // A batch with nothing usable hands the core nothing.
+        pending = {held};
+        read_result = 1;
+        ps5_joypad.poll();
+        assert(sensor(RETRO_SENSOR_ACCELEROMETER_X) == 0.0f);
+        pending = {p};
+        read_result = 1;
+        ps5_joypad.poll();
+        assert(sensor(RETRO_SENSOR_ACCELEROMETER_X) == 0.25f);
+    }
     // The shell intercepting the pad, or the pad leaving, reads as still: the
     // core is answered, with nothing, rather than sent to another driver.
     p.buttons |= pad_button_intercepted;
@@ -404,8 +456,8 @@ int main()
     last_trace.clear();
     ps5_joypad.poll();
     assert(last_trace.rfind("input: motion to core: accel +0.0000 +0.0000 +0.0000 gyro", 0) == 0);
-    assert(last_trace.find("(core asked accel=0 gyro=0, pad switch off, 0 core reads last frame)") !=
-           std::string::npos);
+    assert(last_trace.find("(core asked accel=0 gyro=0, pad switch off, 0 core reads last frame, "
+                           "1 samples)") != std::string::npos);
     motion_trace_deadline = -1.0;
     action_count = 0;
     ps5_joypad.destroy();

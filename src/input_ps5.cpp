@@ -106,8 +106,9 @@
  * The hardware probe, testing only: `<seconds> MOTION [seconds]` in the pad
  * script prints, on every poll for that long (once, without a duration), the
  * newest sample's raw accelerometer and gyroscope, the values a core is handed
- * (libretro's frame), what the core has asked for, the pad's switch and how
- * many sensor reads the core made in the last frame, with the orientation
+ * (libretro's frame, chosen from the frame's batch as `frame_motion` says),
+ * what the core has asked for, the pad's switch, how many sensor reads the
+ * core made in the last frame and the batch's size, with the orientation
  * and the sample's bytes 0x08..0x33 the first time. The first sample after the
  * sensors switch on is traced the same way.
  *
@@ -120,6 +121,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <new>
 
@@ -230,6 +232,34 @@ extern "C" void ps5_input_trace(const char *line) noexcept;
 
 namespace
 {
+/* The six values a core reads, in libretro's frame and units. */
+struct LibretroMotion
+{
+    float accel[3]; // g, X right, Y up, Z toward the player
+    float gyro[3];  // rad/s about the same axes, counter-clockwise positive
+};
+
+/* The pad's raw motion sample in libretro's frame (see the top of this file).
+ * The accelerometer's axes are libretro's already, in g. The gyroscope's are
+ * the same three axes, in rad/s, and only its yaw sign differs: the pad
+ * reports a flat left turn negative and libretro.h wants it positive. This
+ * table is the measured mapping; a console trace that shows a different sign
+ * is corrected here, not downstream. */
+constexpr float accelerometer_sign[3] = {1.0f, 1.0f, 1.0f};
+constexpr float gyroscope_sign[3] = {1.0f, -1.0f, 1.0f};
+
+LibretroMotion to_libretro_frame(const float raw_acceleration[3],
+                                 const float raw_angular_velocity[3]) noexcept
+{
+    LibretroMotion motion{};
+    for (unsigned axis = 0; axis < 3; ++axis)
+    {
+        motion.accel[axis] = accelerometer_sign[axis] * raw_acceleration[axis];
+        motion.gyro[axis] = gyroscope_sign[axis] * raw_angular_velocity[axis];
+    }
+    return motion;
+}
+
 struct PadState
 {
     std::int32_t handle = -1;
@@ -253,6 +283,11 @@ struct PadState
      * "the values exist". */
     unsigned sensor_reads_this_frame = 0;
     unsigned sensor_reads_last_frame = 0;
+    /* The frame's motion for the core (see `frame_motion`), whether it is
+     * usable, and how many samples the last read returned. */
+    LibretroMotion core_motion{};
+    bool core_motion_valid = false;
+    std::int32_t motion_batch = 0;
 };
 
 PadState *active_pad = nullptr;
@@ -509,41 +544,54 @@ std::int16_t stick_axis(std::uint8_t value) noexcept
     return static_cast<std::int16_t>(scaled);
 }
 
-/* The six values a core reads, in libretro's frame and units. */
-struct LibretroMotion
-{
-    float accel[3]; // g, X right, Y up, Z toward the player
-    float gyro[3];  // rad/s about the same axes, counter-clockwise positive
-};
-
-/* The pad's raw motion sample in libretro's frame (see the top of this file).
- * The accelerometer's axes are libretro's already, in g. The gyroscope's are
- * the same three axes, in rad/s, and only its yaw sign differs: the pad
- * reports a flat left turn negative and libretro.h wants it positive. This
- * table is the measured mapping; a console trace that shows a different sign
- * is corrected here, not downstream. */
-constexpr float accelerometer_sign[3] = {1.0f, 1.0f, 1.0f};
-constexpr float gyroscope_sign[3] = {1.0f, -1.0f, 1.0f};
-
-LibretroMotion to_libretro_frame(const float raw_acceleration[3],
-                                 const float raw_angular_velocity[3]) noexcept
-{
-    LibretroMotion motion{};
-    for (unsigned axis = 0; axis < 3; ++axis)
-    {
-        motion.accel[axis] = accelerometer_sign[axis] * raw_acceleration[axis];
-        motion.gyro[axis] = gyroscope_sign[axis] * raw_angular_velocity[axis];
-    }
-    return motion;
-}
-
 /* One libretro sensor value (RETRO_SENSOR_ACCELEROMETER_X..GYROSCOPE_Z). */
-float sensor_value(const PadSample &sample, unsigned id) noexcept
+float motion_component(const LibretroMotion &motion, unsigned id) noexcept
 {
-    const LibretroMotion motion = to_libretro_frame(sample.acceleration, sample.angular_velocity);
     if (id >= RETRO_SENSOR_GYROSCOPE_X)
         return motion.gyro[id - RETRO_SENSOR_GYROSCOPE_X];
     return motion.accel[id - RETRO_SENSOR_ACCELEROMETER_X];
+}
+
+/* The motion a core is handed for a frame, out of the batch of samples one
+ * read returned (about four at the pad's rate). A core reads once a frame,
+ * and a swing's peak lasts a few samples, so the newest sample alone can
+ * miss it: the accelerometer is the batch's sharpest sample, the one whose
+ * magnitude strays furthest from the resting 1 g, taken whole so its
+ * direction is a real one. The gyroscope is the batch's mean, which is the
+ * exact rate over the frame for anything integrating it into an angle
+ * (MotionPlus pointing). At rest or in a slow tilt the samples agree and both
+ * are the newest sample within noise. Samples taken while the pad was away or
+ * the shell had it are left out; false when none is usable. */
+bool frame_motion(const PadSample *samples, int count, LibretroMotion &out) noexcept
+{
+    const PadSample *sharpest = nullptr;
+    float sharpest_stray = -1.0f;
+    float gyro_sum[3] = {0.0f, 0.0f, 0.0f};
+    int usable = 0;
+    for (int index = 0; index < count; ++index)
+    {
+        const PadSample &sample = samples[index];
+        if (!sample.connected || (sample.buttons & pad_button_intercepted) != 0)
+            continue;
+        ++usable;
+        const float *a = sample.acceleration;
+        const float stray = std::fabs(std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) - 1.0f);
+        // Ties go to the later sample, so an unmoving pad reads its newest.
+        if (sharpest == nullptr || stray >= sharpest_stray)
+        {
+            sharpest = &sample;
+            sharpest_stray = stray;
+        }
+        for (unsigned axis = 0; axis < 3; ++axis)
+            gyro_sum[axis] += sample.angular_velocity[axis];
+    }
+    if (usable == 0)
+        return false;
+    float gyro_mean[3];
+    for (unsigned axis = 0; axis < 3; ++axis)
+        gyro_mean[axis] = gyro_sum[axis] / static_cast<float>(usable);
+    out = to_libretro_frame(sharpest->acceleration, gyro_mean);
+    return true;
 }
 
 /* Tells the pad whether anything wants its motion sensors, once per change. The
@@ -587,14 +635,16 @@ void trace_motion(const PadState &state, double seconds, bool bytes) noexcept
                   "input: motion at %.3f s: raw accel %+.4f %+.4f %+.4f gyro %+.4f %+.4f %+.4f",
                   seconds, a[0], a[1], a[2], g[0], g[1], g[2]);
     ps5_input_trace(line);
-    const LibretroMotion motion = to_libretro_frame(a, g);
+    const LibretroMotion motion =
+        state.core_motion_valid ? state.core_motion : to_libretro_frame(a, g);
     std::snprintf(line, sizeof(line),
                   "input: motion to core: accel %+.4f %+.4f %+.4f gyro %+.4f %+.4f %+.4f "
-                  "(core asked accel=%d gyro=%d, pad switch %s, %u core reads last frame)",
+                  "(core asked accel=%d gyro=%d, pad switch %s, %u core reads last frame, "
+                  "%d samples)",
                   motion.accel[0], motion.accel[1], motion.accel[2], motion.gyro[0], motion.gyro[1],
                   motion.gyro[2], state.accelerometer_enabled ? 1 : 0,
                   state.gyroscope_enabled ? 1 : 0, state.motion_on ? "on" : "off",
-                  state.sensor_reads_last_frame);
+                  state.sensor_reads_last_frame, static_cast<int>(state.motion_batch));
     ps5_input_trace(line);
     if (!bytes)
         return;
@@ -674,11 +724,15 @@ void poll_pad(void *data) noexcept
          * down. */
         state->sample_count = 0;
         state->buttons = 0;
+        state->core_motion_valid = false;
+        state->motion_batch = 0;
         return;
     }
     state->sample_count = count;
     const PadSample *newest = newest_sample(*state);
     state->buttons = newest != nullptr ? newest->buttons : 0;
+    state->motion_batch = count;
+    state->core_motion_valid = frame_motion(state->samples, count, state->core_motion);
 
     /* Successful button transitions are routine, not diagnostics. Keep pad-open
      * failures and lifecycle logs, without a synchronous file write per press. */
@@ -949,8 +1003,9 @@ bool joypad_get_sensor_input(unsigned port, unsigned id, float *value) noexcept
         !(gyroscope && active_pad->gyroscope_enabled))
         return false;
     ++active_pad->sensor_reads_this_frame;
-    const PadSample *sample = newest_sample(*active_pad);
-    *value = sample != nullptr ? sensor_value(*sample, id) : 0.0f;
+    // A pad that is away or held by the shell reads as still, as its buttons do.
+    const bool live = newest_sample(*active_pad) != nullptr && active_pad->core_motion_valid;
+    *value = live ? motion_component(active_pad->core_motion, id) : 0.0f;
     return true;
 }
 
