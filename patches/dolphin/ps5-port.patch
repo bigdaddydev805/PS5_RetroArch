@@ -645,6 +645,62 @@ index 7d27a1ea3c..0d882dcb74 100644
  
    struct retro_core_options_v2 options_us = {
      const_cast<retro_core_option_v2_category*>(option_cats),
+diff --git a/Source/Core/DolphinLibretro/Input.cpp b/Source/Core/DolphinLibretro/Input.cpp
+index 5250054bf4..d3bf6e9e39 100644
+--- a/Source/Core/DolphinLibretro/Input.cpp
++++ b/Source/Core/DolphinLibretro/Input.cpp
+@@ -716,6 +716,29 @@ void Shutdown()
+   rumble.set_rumble_state = nullptr;
+ }
+ 
++#ifdef __PROSPERO__
++// libretro.h's sensor frame is X right, Y up, Z toward the player, with the
++// angular velocity about those axes and counter-clockwise positive. The
++// functions below, and the Sensor device's control expressions in
++// retro_set_controller_port_device_wii, read the three values as the Wii
++// Remote's own frame instead: X left, Y toward the player, Z up. PS5 RetroArch's
++// pad driver (src/input_ps5.cpp) hands over libretro.h's frame, so it is turned
++// into the remote's at this boundary: left = -X, back = Z, up = Y. That is a
++// rotation (a half turn about the axis between Y and Z), so it serves the
++// gyroscope's axes unchanged: the remote's pitch is -X, its roll is Z and its
++// yaw is Y. A pad lying flat then reads +1 g "up", which is what
++// WiimoteEmu::Wiimote::GetTotalAcceleration takes as rest.
++static void LibretroToWiimoteFrame(float& x, float& y, float& z)
++{
++  const float libretro_x = x;
++  const float libretro_y = y;
++  const float libretro_z = z;
++  x = -libretro_x;
++  y = libretro_z;
++  z = libretro_y;
++}
++#endif
++
+ void UpdateAccelerometer(unsigned port)
+ {
+   if (!sensor_enabled[port][SENSOR_ACCELEROMETER] || !sensor_interface.get_sensor_input)
+@@ -728,6 +751,10 @@ void UpdateAccelerometer(unsigned port)
+   float ay = sensor_interface.get_sensor_input(port, RETRO_SENSOR_ACCELEROMETER_Y) * G;
+   float az = sensor_interface.get_sensor_input(port, RETRO_SENSOR_ACCELEROMETER_Z) * G;
+ 
++#ifdef __PROSPERO__
++  LibretroToWiimoteFrame(ax, ay, az);
++#endif
++
+   // Collapsed, so a sideways remote with the dongle fitted still rotates.
+   if (wiimote_base_device(input_types[port]) == RETRO_DEVICE_WIIMOTE_SW)
+   {
+@@ -758,6 +785,10 @@ void UpdateGyro(unsigned port)
+   float gy = sensor_interface.get_sensor_input(port, RETRO_SENSOR_GYROSCOPE_Y);
+   float gz = sensor_interface.get_sensor_input(port, RETRO_SENSOR_GYROSCOPE_Z);
+ 
++#ifdef __PROSPERO__
++  LibretroToWiimoteFrame(gx, gy, gz);
++#endif
++
+   if (wiimote_base_device(input_types[port]) == RETRO_DEVICE_WIIMOTE_SW)
+   {
+     float rx = -gy;   // rotate 90° clockwise
 diff --git a/Source/Core/DolphinLibretro/Main.cpp b/Source/Core/DolphinLibretro/Main.cpp
 index cd8753b666..85271453ba 100644
 --- a/Source/Core/DolphinLibretro/Main.cpp

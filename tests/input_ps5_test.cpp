@@ -1,6 +1,8 @@
-/* Exercise the real raw joypad callbacks used by the binding screen. */
+/* Exercise the real raw joypad callbacks used by the binding screen, and the
+ * motion sensors a core reads through the same driver. */
 #include <cassert>
 #include <cmath>
+#include <string>
 #include <vector>
 #include "../src/input_ps5.cpp"
 #include "input_state_wrap.inc"
@@ -10,6 +12,12 @@ namespace
 std::vector<PadSample> pending;
 int read_result = 0;
 unsigned reads = 0, opens = 0, closes = 0, connects = 0, disconnects = 0;
+// The pad's motion-sensor switch: how often it was thrown, the last position,
+// and what the service answers.
+unsigned motion_calls = 0;
+bool motion_last = false;
+int32_t motion_result = 0;
+std::string last_trace;
 PadSample sample()
 {
     PadSample p{};
@@ -41,6 +49,13 @@ extern "C"
         ++closes;
         return 0;
     }
+    int32_t scePadSetMotionSensorState(int32_t handle, bool enable)
+    {
+        assert(handle == 1);
+        ++motion_calls;
+        motion_last = enable;
+        return motion_result;
+    }
     int32_t scePadRead(int32_t, void *out, int32_t capacity)
     {
         ++reads;
@@ -69,8 +84,9 @@ extern "C"
     {
         return 0;
     }
-    void ps5_input_trace(const char *) noexcept
+    void ps5_input_trace(const char *line) noexcept
     {
+        last_trace = line;
     }
     bool input_autoconfigure_connect(const char *name, const char *, const char *,
                                      const char *driver, unsigned port, unsigned, unsigned)
@@ -238,6 +254,162 @@ int main()
     assert(opens == 2 && closes == 2);
     ps5_input_reset_autoconfig(); // Safe before/after driver lifetime.
 
+    // The motion sensors: nothing before a core asks; the pad's switch thrown once
+    // for both sensors and back once both are off; port 0 only; no light sensor.
+    assert(ps5_joypad.init(input));
+    feed(sample());
+    float value = 1.0f;
+    assert(!ps5_joypad.get_sensor_input(0, RETRO_SENSOR_ACCELEROMETER_X, &value));
+    assert(!ps5_joypad.get_sensor_input(0, RETRO_SENSOR_GYROSCOPE_Z, &value));
+    assert(motion_calls == 0);
+    assert(ps5_joypad.set_sensor_state(0, RETRO_SENSOR_ACCELEROMETER_ENABLE, 60));
+    assert(motion_calls == 1 && motion_last);
+    assert(ps5_joypad.set_sensor_state(0, RETRO_SENSOR_GYROSCOPE_ENABLE, 60));
+    assert(motion_calls == 1);
+    assert(!ps5_joypad.set_sensor_state(1, RETRO_SENSOR_ACCELEROMETER_ENABLE, 60));
+    assert(!ps5_joypad.set_sensor_state(0, RETRO_SENSOR_ILLUMINANCE_ENABLE, 60));
+    assert(!ps5_joypad.get_sensor_input(0, RETRO_SENSOR_ILLUMINANCE, &value));
+    // The values are the sample's fields in libretro's frame: the accelerometer
+    // as read (g, X right, Y up, Z toward the player), the gyroscope (rad/s) as
+    // read except for yaw, which the pad reports with the opposite sign.
+    p = sample();
+    p.acceleration[0] = 0.25f;
+    p.acceleration[1] = 1.0f;
+    p.acceleration[2] = -0.5f;
+    p.angular_velocity[0] = 0.1f;
+    p.angular_velocity[1] = 0.2f;
+    p.angular_velocity[2] = 0.3f;
+    feed(p);
+    auto sensor = [&](unsigned id)
+    {
+        float v = -99.0f;
+        assert(ps5_joypad.get_sensor_input(0, id, &v));
+        return v;
+    };
+    assert(sensor(RETRO_SENSOR_ACCELEROMETER_X) == 0.25f);
+    assert(sensor(RETRO_SENSOR_ACCELEROMETER_Y) == 1.0f);
+    assert(sensor(RETRO_SENSOR_ACCELEROMETER_Z) == -0.5f);
+    assert(sensor(RETRO_SENSOR_GYROSCOPE_X) == 0.1f);
+    assert(sensor(RETRO_SENSOR_GYROSCOPE_Y) == -0.2f);
+    assert(sensor(RETRO_SENSOR_GYROSCOPE_Z) == 0.3f);
+    assert(!ps5_joypad.get_sensor_input(1, RETRO_SENSOR_ACCELEROMETER_X, &value));
+    // The first sample after switching on was traced, bytes included, and the
+    // layout the trace reads is the one the assertions pin.
+    assert(last_trace.rfind("input: motion sample bytes 0x08..0x33:", 0) == 0);
+    assert(last_trace.find(" 00 00 80 3f ") != std::string::npos); // 1.0f at 0x20 (accel Y)
+
+    // The frame conversion itself, against what was measured on the console
+    // (2026-09-30), one physical pose or movement at a time.
+    {
+        const float still[3] = {0.0f, 0.0f, 0.0f};
+        // Left handle down: raw X positive, and libretro X (right side up) positive.
+        const float left_handle_down[3] = {0.98f, 0.1f, 0.0f};
+        LibretroMotion m = to_libretro_frame(left_handle_down, still);
+        assert(m.accel[0] == 0.98f && m.accel[1] == 0.1f && m.accel[2] == 0.0f);
+        // Front edge down: raw Z positive, and libretro Z (player's edge up) positive.
+        const float front_edge_down[3] = {0.0f, 0.1f, 0.97f};
+        m = to_libretro_frame(front_edge_down, still);
+        assert(m.accel[2] == 0.97f && m.accel[0] == 0.0f);
+        // Resting flat: the 1 g on Y is handed over as 1 g, no unit change.
+        const float flat[3] = {0.02f, 1.0f, -0.01f};
+        m = to_libretro_frame(flat, still);
+        assert(m.accel[1] == 1.0f && m.accel[0] == 0.02f && m.accel[2] == -0.01f);
+        // A flat left turn: the pad reports yaw negative; libretro.h wants
+        // counter-clockwise seen from above, which a left turn is, positive.
+        const float yaw_left[3] = {0.0f, -1.5f, 0.0f};
+        m = to_libretro_frame(still, yaw_left);
+        assert(m.gyro[1] == 1.5f && m.gyro[0] == 0.0f && m.gyro[2] == 0.0f);
+        const float yaw_right[3] = {0.0f, 0.7f, 0.0f};
+        assert(to_libretro_frame(still, yaw_right).gyro[1] == -0.7f);
+        // The measured bank, left handle up: roll negative is clockwise seen
+        // from the player, which is what libretro's Z wants; rad/s unchanged.
+        const float bank_left_handle_up[3] = {-0.89f, 0.34f, -3.15f};
+        m = to_libretro_frame(still, bank_left_handle_up);
+        assert(m.gyro[2] == -3.15f && m.gyro[0] == -0.89f && m.gyro[1] == -0.34f);
+        // Pitch passes through: the front edge rising positive.
+        const float pitch_up[3] = {1.2f, 0.0f, 0.0f};
+        assert(to_libretro_frame(still, pitch_up).gyro[0] == 1.2f);
+        // Only yaw is negated: the table says so, and nothing is scaled.
+        for (unsigned axis = 0; axis < 3; ++axis)
+        {
+            assert(accelerometer_sign[axis] == 1.0f);
+            assert(gyroscope_sign[axis] == (axis == 1 ? -1.0f : 1.0f));
+        }
+    }
+    // The probe counts the core's reads: six here, reported on the next poll,
+    // alongside the values handed over and the requested state.
+    actions[0] = ScriptAction{0.0, false, ScriptActionKind::motion, -1};
+    action_count = 1;
+    last_trace.clear();
+    ps5_joypad.poll();
+    assert(last_trace.rfind("input: motion sample bytes", 0) == 0);
+    action_count = 0;
+    for (unsigned id = RETRO_SENSOR_ACCELEROMETER_X; id <= RETRO_SENSOR_GYROSCOPE_Z; ++id)
+        (void)sensor(id);
+    ps5_joypad.poll();
+    trace_motion(*active_pad, 1.0, false);
+    assert(last_trace.rfind("input: motion to core: accel +0.2500 +1.0000 -0.5000 gyro +0.1000 "
+                            "-0.2000 +0.3000 (core asked accel=1 gyro=1, pad switch on, "
+                            "6 core reads last frame)",
+                            0) == 0);
+    ps5_joypad.poll();
+    trace_motion(*active_pad, 1.0, false);
+    assert(last_trace.find("0 core reads last frame") != std::string::npos);
+    // The shell intercepting the pad, or the pad leaving, reads as still: the
+    // core is answered, with nothing, rather than sent to another driver.
+    p.buttons |= pad_button_intercepted;
+    feed(p);
+    assert(sensor(RETRO_SENSOR_ACCELEROMETER_Y) == 0.0f);
+    p.buttons = 0;
+    p.connected = 0;
+    feed(p);
+    assert(sensor(RETRO_SENSOR_ACCELEROMETER_Y) == 0.0f && motion_calls == 1);
+    // A pad that comes back is switched on again, once.
+    p.connected = 1;
+    feed(p);
+    assert(motion_calls == 2 && motion_last);
+    assert(sensor(RETRO_SENSOR_ACCELEROMETER_Y) == 1.0f);
+    // One sensor off keeps the pad's switch on; the second turns it off.
+    assert(ps5_joypad.set_sensor_state(0, RETRO_SENSOR_ACCELEROMETER_DISABLE, 0));
+    assert(motion_calls == 2);
+    assert(!ps5_joypad.get_sensor_input(0, RETRO_SENSOR_ACCELEROMETER_X, &value));
+    assert(sensor(RETRO_SENSOR_GYROSCOPE_Z) == 0.3f);
+    assert(ps5_joypad.set_sensor_state(0, RETRO_SENSOR_GYROSCOPE_DISABLE, 0));
+    assert(motion_calls == 3 && !motion_last);
+    assert(!ps5_joypad.get_sensor_input(0, RETRO_SENSOR_GYROSCOPE_Z, &value));
+    // A service that refuses leaves the core with no sensor.
+    motion_result = -1;
+    assert(!ps5_joypad.set_sensor_state(0, RETRO_SENSOR_GYROSCOPE_ENABLE, 60));
+    assert(motion_calls == 4 && !ps5_joypad.get_sensor_input(0, RETRO_SENSOR_GYROSCOPE_X, &value));
+    motion_result = 0;
+    assert(ps5_joypad.set_sensor_state(0, RETRO_SENSOR_GYROSCOPE_ENABLE, 60));
+    assert(motion_calls == 5);
+    // Closing the driver with a sensor on switches the pad's off.
+    ps5_joypad.destroy();
+    assert(motion_calls == 6 && !motion_last && closes == 3);
+    // MOTION traces on the poll it arms, and for the seconds it was given.
+    assert(ps5_joypad.init(input));
+    feed(sample());
+    actions[0] = ScriptAction{0.0, false, ScriptActionKind::motion, -1};
+    action_count = 1;
+    last_trace.clear();
+    ps5_joypad.poll();
+    assert(last_trace.rfind("input: motion sample bytes", 0) == 0);
+    last_trace.clear();
+    ps5_joypad.poll();
+    assert(last_trace.empty());
+    actions[0] = ScriptAction{0.0, false, ScriptActionKind::motion, 60};
+    action_count = 1;
+    ps5_joypad.poll();
+    last_trace.clear();
+    ps5_joypad.poll();
+    assert(last_trace.rfind("input: motion to core: accel +0.0000 +0.0000 +0.0000 gyro", 0) == 0);
+    assert(last_trace.find("(core asked accel=0 gyro=0, pad switch off, 0 core reads last frame)") !=
+           std::string::npos);
+    motion_trace_deadline = -1.0;
+    action_count = 0;
+    ps5_joypad.destroy();
+
     // STOP ends the run on the next frame, as --max-frames does, and only once.
     test_video.frame_count = 1234;
     actions[0] = ScriptAction{0.0, false, ScriptActionKind::stop};
@@ -248,6 +420,6 @@ int main()
     run_script_actions();
     assert(test_runloop.max_frames == 1235);
     action_count = 0;
-    std::puts("PS5 joypad: raw binding capture, axes, user mappings, poll retention, lifecycle and "
-              "the script's STOP PASS");
+    std::puts("PS5 joypad: raw binding capture, axes, user mappings, poll retention, lifecycle, "
+              "motion sensors and the script's STOP and MOTION PASS");
 }

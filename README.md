@@ -41,7 +41,7 @@ was the last on ps5vk, the project's first driver.
 | Vulkan video output | ✅ Menu and software-core frames presented through RADV, Mesa's Vulkan driver, linked into the title (PS5_Vulkan's port, reporting Vulkan 1.4). ps5vk remains a build option |
 | XMB | ✅ Default menu, with icons, fonts and background rendering |
 | RGUI | ✅ Alternative menu |
-| Native controller input | ✅ Buttons, left-stick menu navigation and button/axis binding capture |
+| Native controller input | ✅ Buttons, left-stick menu navigation and button/axis binding capture. 🚧 DualSense accelerometer and gyroscope through libretro's sensor interface: the raw sample fields, units (g, rad/s) and the X and Z axes were measured on a console, and the driver hands cores libretro.h's frame (one sign change, yaw). Dolphin's Wii Remote gets that frame rotated into its own inside the core. The resting sign of the accelerometer's Y axis and the pitch sign are the next console check; no game's motion controls are claimed to work yet |
 | Native audio | ✅ `audio_ps5` stereo PCM output, audible channel test and buffering diagnostics |
 | Filesystem and configuration | ✅ Directory browsing, configuration loading/saving and FTP-writable application folders |
 | Core loading | ✅ Native shared-core loader, official `.info` discovery and recovery from rejected loads |
@@ -152,6 +152,7 @@ in this port, even if upstream RetroArch already offers the feature.**
 - ✅ GPU presentation through PS5_Vulkan; selectable CPU fallback.
 - ✅ XMB, with RGUI retained.
 - ✅ Native input, analog menu navigation and remapping.
+- 🚧 DualSense motion (accelerometer and gyroscope) through the libretro sensor API, in libretro.h's frame and units, from sample fields and axes measured on a console; Dolphin's core rotates that frame into the Wii Remote's. Awaiting the Wii Sports console test.
 - ✅ Native stereo audio and buffering diagnostics.
 - ✅ Filesystem browsing, configuration persistence and content loading.
 - ✅ Native core loading, metadata and failed-load recovery.
